@@ -66,6 +66,9 @@ class AssetDownloadTaskView(gui3d.TaskView):
     def __init__(self, category):
         gui3d.TaskView.__init__(self, category, 'Download assets')
 
+        gui3d.app.addSetting('assetdownload_auto_selected_preview', False)
+        gui3d.app.addSetting('assetdownload_auto_details_preview', False)
+
         self.log = mhapi.utility.getLogChannel("assetdownload")
 
         self.notfound = mhapi.locations.getSystemDataPath("notfound.thumb")
@@ -79,6 +82,11 @@ class AssetDownloadTaskView(gui3d.TaskView):
 
         self.currentlySelectedRemoteAsset = None
         self.isShowingDetails = False
+        self._selectedPreviewDownloadAssetId = None
+        self._selectedSpinnerFrames = [u"\u25d0", u"\u25d3", u"\u25d1", u"\u25d2"]
+        self._selectedSpinnerIndex = 0
+        self._selectedSpinnerTimer = QTimer()
+        self._selectedSpinnerTimer.timeout.connect(self._advanceSelectedSpinner)
 
     def onShow(self, event):
 
@@ -88,6 +96,8 @@ class AssetDownloadTaskView(gui3d.TaskView):
             msg = msg + "looks as if the download has stalled. Updating the database after it has been downloaded will be significantly faster.\n\n"
             msg = msg + "After closing this dialog, click 'synchronize' in order to start downloading the asset database."
             self.showMessage(msg)
+        elif self.assetdb.isSynchronized:
+            self._onBtnFilterClick()
 
     def _setupFilterBox(self):
         self.log.trace("Enter")
@@ -166,6 +176,12 @@ class AssetDownloadTaskView(gui3d.TaskView):
         def onClicked(event):
             self._onBtnFilterClick()
 
+        self.cbxSubTypes.currentIndexChanged.connect(self._onAutoFilterChange)
+        self.cbxAuthors.currentIndexChanged.connect(self._onAutoFilterChange)
+        self.cbxLicense.currentIndexChanged.connect(self._onAutoFilterChange)
+        self.cbxDownloaded.currentIndexChanged.connect(self._onAutoFilterChange)
+        self.cbxUpdated.currentIndexChanged.connect(self._onAutoFilterChange)
+
         self.addLeftWidget(self.filterBox)
 
     def _onTypeChange(self,newValue):
@@ -182,6 +198,11 @@ class AssetDownloadTaskView(gui3d.TaskView):
             self.cbxSubTypes.addItem("-- any --")
             if newValue == "material":
                 self.cbxSubTypes.addItem("for core asset")
+
+        self._onBtnFilterClick()
+
+    def _onAutoFilterChange(self, *args):
+        self._onBtnFilterClick()
 
 
     def _onBtnFilterClick(self):
@@ -257,6 +278,16 @@ class AssetDownloadTaskView(gui3d.TaskView):
         self.thumbnail.setMaximumHeight(128)
         self.thumbnail.setMaximumWidth(128)
         self.thumbnail.setScaledContents(True)
+        self.thumbnail.setAlignment(Qt.AlignCenter)
+
+        self.autoGetSelectedPreview = self.selectBox.addWidget(gui.CheckBox('automatic get screenshot', gui3d.app.getSetting('assetdownload_auto_selected_preview')))
+
+        @self.autoGetSelectedPreview.mhEvent
+        def onClicked(event):
+            gui3d.app.setSetting('assetdownload_auto_selected_preview', self.autoGetSelectedPreview.selected)
+            gui3d.app.saveSettings()
+            if self.autoGetSelectedPreview.selected:
+                self._ensureSelectedPreviewDownloaded()
 
         self.selectBox.addWidget(mhapi.ui.createLabel(" "))
 
@@ -292,6 +323,8 @@ class AssetDownloadTaskView(gui3d.TaskView):
 
         title = self.currentlySelectedRemoteAsset.getTitle()
         self.log.debug("Request details for asset with title",title)
+        self._ensureDetailsPreviewDownloaded()
+        self._refreshDetailsPreview()
 
         self.tableView.hide()
         self.detailsPanel.show()
@@ -415,15 +448,109 @@ class AssetDownloadTaskView(gui3d.TaskView):
         tups = remoteAsset.getDownloadTuples(ignoreExisting=True, onlyMeta=True, excludeThumb=True, excludeScreenshot=False)
         self.screenshotDt = DownloadTask(self, tups, self._afterScreenshotDownloaded)
 
+    def _advanceSelectedSpinner(self):
+        self.thumbnail.setPixmap(QtGui.QPixmap())
+        self.thumbnail.setText(self._selectedSpinnerFrames[self._selectedSpinnerIndex])
+        self._selectedSpinnerIndex = (self._selectedSpinnerIndex + 1) % len(self._selectedSpinnerFrames)
+
+    def _showSelectedPreviewLoading(self):
+        self._selectedSpinnerIndex = 0
+        self.thumbnail.setStyleSheet("font-size: 42px;")
+        self._advanceSelectedSpinner()
+        self._selectedSpinnerTimer.start(120)
+
+    def _stopSelectedPreviewLoading(self):
+        self._selectedSpinnerTimer.stop()
+        self.thumbnail.setText("")
+        self.thumbnail.setStyleSheet("")
+
+    def _refreshSelectedPreview(self):
+        remoteAsset = self.currentlySelectedRemoteAsset
+        if remoteAsset is None:
+            self._stopSelectedPreviewLoading()
+            self.thumbnail.setPixmap(QtGui.QPixmap(os.path.abspath(self.notfound)))
+            return False
+
+        thumbPath = remoteAsset.getThumbPath()
+        screenshotPath = remoteAsset.getScreenshotPath()
+
+        self._stopSelectedPreviewLoading()
+
+        if thumbPath is not None and os.path.exists(thumbPath):
+            self.thumbnail.setPixmap(QtGui.QPixmap(os.path.abspath(thumbPath)))
+            return True
+        elif screenshotPath is not None and os.path.exists(screenshotPath):
+            self.thumbnail.setPixmap(QtGui.QPixmap(os.path.abspath(screenshotPath)))
+            return True
+        else:
+            self.thumbnail.setPixmap(QtGui.QPixmap(os.path.abspath(self.notfound)))
+            return False
+
+    def _resetSelectedPreview(self):
+        self._stopSelectedPreviewLoading()
+        self.thumbnail.setPixmap(QtGui.QPixmap(os.path.abspath(self.notfound)))
+
+    def _ensureDetailsPreviewDownloaded(self):
+        remoteAsset = self.currentlySelectedRemoteAsset
+        if remoteAsset is None:
+            return
+
+        if not self.autoGetDetailsPreview.selected:
+            return
+
+        render = remoteAsset.getScreenshotPath()
+        if render is not None and render != "" and os.path.exists(render):
+            return
+
+        tups = remoteAsset.getDownloadTuples(ignoreExisting=True, onlyMeta=True, excludeThumb=False, excludeScreenshot=False)
+        if len(tups) > 0:
+            self.screenshotDt = DownloadTask(self, tups, self._afterScreenshotDownloaded)
+
+    def _ensureSelectedPreviewDownloaded(self):
+        remoteAsset = self.currentlySelectedRemoteAsset
+        if remoteAsset is None:
+            return
+
+        if not self.autoGetSelectedPreview.selected:
+            return
+
+        if self._refreshSelectedPreview():
+            self._selectedPreviewDownloadAssetId = None
+            return
+
+        assetId = remoteAsset.getId()
+        if self._selectedPreviewDownloadAssetId == assetId:
+            return
+
+        tups = remoteAsset.getDownloadTuples(ignoreExisting=True, onlyMeta=True, excludeThumb=False, excludeScreenshot=False)
+        if len(tups) > 0:
+            self._selectedPreviewDownloadAssetId = assetId
+            self._showSelectedPreviewLoading()
+            self.selectedPreviewDt = DownloadTask(self, tups, self._afterSelectedPreviewDownloaded)
+
+    def _afterSelectedPreviewDownloaded(self, code=0, file=None):
+        self._selectedPreviewDownloadAssetId = None
+        self._refreshSelectedPreview()
+
     def _afterScreenshotDownloaded(self, code=0, file=None):
         self.log.debug("Downloaded")
+        self._refreshSelectedPreview()
+        self._refreshDetailsPreview()
+
+    def _refreshDetailsPreview(self):
         remoteAsset = self.currentlySelectedRemoteAsset
+        if remoteAsset is None:
+            return
+
         render = remoteAsset.getScreenshotPath()
 
         if render is not None and render != "" and os.path.exists(render):
             self.detailsRender.setPixmap(QtGui.QPixmap(os.path.abspath(render)))
             self.detailsRender.setGeometry(0, 0, 800, 600)
             self.btnDownloadScreenshot.hide()
+        else:
+            self.detailsRender.setPixmap(QtGui.QPixmap(mhapi.locations.getSystemDataPath("notfound.thumb")))
+            self.btnDownloadScreenshot.show()
 
     def _setupDetails(self):
         self.log.trace("Enter")
@@ -443,6 +570,17 @@ class AssetDownloadTaskView(gui3d.TaskView):
         self.detailsRender = gui.TextView()
         self.detailsRender.setPixmap(QPixmap(os.path.abspath(self.notfound)))
         layout.addWidget(self.detailsRender)
+
+        self.autoGetDetailsPreview = gui.CheckBox('automatic get screenshot', gui3d.app.getSetting('assetdownload_auto_details_preview'))
+        layout.addWidget(self.autoGetDetailsPreview)
+
+        @self.autoGetDetailsPreview.mhEvent
+        def onClicked(event):
+            gui3d.app.setSetting('assetdownload_auto_details_preview', self.autoGetDetailsPreview.selected)
+            gui3d.app.saveSettings()
+            if self.autoGetDetailsPreview.selected:
+                self._ensureDetailsPreviewDownloaded()
+                self._refreshDetailsPreview()
 
         self.btnDownloadScreenshot = mhapi.ui.createButton("Download screenshot")
 
@@ -501,16 +639,12 @@ class AssetDownloadTaskView(gui3d.TaskView):
 
         remoteAsset = self.assetdb.remoteAssets[assetType][assetId]
 
-        thumbPath = remoteAsset.getThumbPath()
-
-        if thumbPath is not None:
-            self.thumbnail.setPixmap(QtGui.QPixmap(os.path.abspath(thumbPath)))
-        else:
-            self.log.debug("Asset has no thumbnail")
-
         self.thumbnail.setGeometry(0, 0, 128, 128)
+        self._resetSelectedPreview()
 
         self.currentlySelectedRemoteAsset = remoteAsset
+        if not self._refreshSelectedPreview():
+            self._ensureSelectedPreviewDownloaded()
 
         self.detailsName.setText("<h1>" + remoteAsset.getTitle() + "</h1>")
         self.detailsDesc.setText("<p>" + remoteAsset.getDescription() + "</p>")
@@ -523,15 +657,7 @@ class AssetDownloadTaskView(gui3d.TaskView):
         extras = extras + "</tt>"
         self.detailsExtras.setText(extras)
 
-        render = remoteAsset.getScreenshotPath()
-
-        if render is not None and render != "" and os.path.exists(render):
-            self.detailsRender.setPixmap(QtGui.QPixmap(os.path.abspath(render)))
-            self.detailsRender.setGeometry(0, 0, 800, 600)
-            self.btnDownloadScreenshot.hide()
-        else:
-            self.detailsRender.setPixmap(QtGui.QPixmap(mhapi.locations.getSystemDataPath("notfound.thumb")))
-            self.btnDownloadScreenshot.show()
+        self._refreshDetailsPreview()
 
 
     def showMessage(self,message,title="Information"):
@@ -541,4 +667,3 @@ class AssetDownloadTaskView(gui3d.TaskView):
         self.msg.setWindowTitle(title)
         self.msg.setStandardButtons(QMessageBox.Ok)
         self.msg.show()
-
